@@ -1,0 +1,127 @@
+================================================================================
+MEAN-REVERSION REGIME GATE STUDY - CONTEXT RESUME (v1, 2026-10-17)
+================================================================================
+
+[SUMMARY]
+A causal regime gate (state machine with hysteresis) that tells a mean-reversion
+strategy, per closed bar, whether it may open trades and whether it must go flat.
+Tested on synthetic OU / random-walk / trend / regime-switch prices.
+Repo: github.com/vikaschouhan/backtest_ai, directory meanrev_gates_study-0/.
+Code lives in the .py files; this file holds the spec, history and findings.
+Context: complements the user's mean-reversion framework (ADF, Hurst, OU, GARCH,
+z-scores, ADX regime layer) and strategy-search engine (Python orchestration +
+C hot-path kernel). Target markets: Nifty, BankNifty, MCX.
+
+--------------------------------------------------------------------------------
+PART 1: CURRENT SPEC
+--------------------------------------------------------------------------------
+- Call RegimeGate.on_bar(Features) once per CLOSED bar, in order. No lookahead:
+  features must come from rolling windows ending at that bar.
+- Features: hurst, adf_pvalue, half_life (bars), adx, blackout (bool).
+  None = unavailable -> that check FAILS (no data, no trade).
+- Output GateDecision: regime, allow_entries, force_exit, score, reasons[].
+- The gate does NOT generate trades; signal + exits live in the strategy.
+
+CHECKS (score = fraction passing, 6 checks)
+  hurst            hurst < 0.45
+  adf              adf_pvalue < 0.05
+  adx              adx < 20
+  half_life_range  2 <= half_life <= 30
+  half_life_stable std/mean of last <=20 half-lives < 0.35 (needs >=5 values)
+  adf_falling      mean(last 10 p) <= mean(previous 10 p), or last-10 mean < 0.01
+
+STATES
+  TRENDING        no entries; positions flat
+  TRANSITIONAL    no new entries; open positions run to their own exits
+  MEAN_REVERTING  entries allowed
+  Start state: TRENDING.
+
+TRANSITIONS (evaluated in this order each bar)
+  1. Hard break: hurst > 0.58 OR adx > 30  -> TRENDING, force_exit, cooldown=10,
+     reset confirmation counters. No confirmation needed.
+  2. In MR: score < 0.55 for 2 consecutive bars -> TRANSITIONAL.
+  3. In TRENDING/TRANSITIONAL:
+       score >= 0.80 for 3 consecutive bars (and cooldown == 0) -> MR
+       TRANSITIONAL and score < 0.30 -> TRENDING, force_exit
+       TRENDING and score >= 0.55 (and cooldown == 0) -> TRANSITIONAL
+  Blackout: allow_entries = False in any state; if blackout_forces_exit, also
+  force_exit. State itself is unchanged.
+  All thresholds live in GateConfig.
+
+PERSISTENCE
+  to_json() / from_json() save config, state, counters, cooldown and the
+  half-life / ADF histories, so a restart continues identically (tested).
+
+REFERENCE FEATURES (regime_gate.py, for testing / parity with C kernel)
+  hurst_exponent  slope of log std(lagged diffs) vs log lag, lags 2..19
+  ou_half_life    AR(1): dx = a + b*x[t-1]; HL = -ln2 / ln(1+b); inf if b>=0
+  adf_pvalue      statsmodels adfuller(maxlag=1, autolag=None); None if missing
+  adx             Wilder ADX(14) from high/low/close
+
+--------------------------------------------------------------------------------
+PART 2: TEST SETUP (gate_tests.py)
+--------------------------------------------------------------------------------
+- 1,500 bars per run, 120-bar feature window, 10 seeds (1000..1009).
+- Scenarios: ou_strong (theta 0.10, sigma 0.6), ou_weak (theta 0.02),
+  random_walk (sigma 0.6), trend (drift 0.12), regime_switch (4 equal segments:
+  OU -> trend(drift 0.20) -> OU -> random walk). High/low = close +/- |N(0,0.3)|.
+- Toy strategy: 20-bar z-score; long z < -2, short z > 2; exit at z crossing 0,
+  20-bar time stop, or gate force_exit; cost 0.02 pts per side; fills at bar
+  close (toy, not realistic). Gated version only enters when allow_entries.
+- Figures: seed 0 per scenario (price shaded by gate state, score with
+  thresholds, cumulative PnL gated vs ungated) + summary over all seeds.
+
+--------------------------------------------------------------------------------
+PART 3: RESULTS (means over 10 seeds)
+--------------------------------------------------------------------------------
+  scenario        MR%   TX%   TR%   ungated  gated
+  ou_strong       85.5  13.3   1.2   +64.3   +53.3
+  ou_weak         40.5  34.0  25.5   +18.3    +7.5
+  random_walk     27.8  31.4  40.8    -5.9    +0.2
+  trend            6.3  17.5  76.2   -73.9    -6.6
+  regime_switch   43.7  20.4  35.9    -4.6   +19.8
+  regime_switch: MR precision 72.4%, recall 69.1%,
+                 median lag leave-MR 16.5 bars, enter-MR 60 bars.
+
+Per-check pass rates (3 seeds):
+  check             ou_strong  random_walk  trend
+  hurst                95%        48%        48%
+  adf                  37%         2%         3%
+  adx                  94%        58%        32%
+  half_life_range     100%        64%        25%
+  half_life_stable     98%        70%        39%
+  adf_falling          56%        52%        51%
+
+--------------------------------------------------------------------------------
+PART 4: FINDINGS
+--------------------------------------------------------------------------------
+- Main job works: trend loss cut from -74 to -7; regime switch flips to profit.
+- Strong OU gives up ~17% of ungated PnL (warm-up + short TRANSITIONAL dips).
+- Too permissive on random walks (MR 28% of bars):
+    * adf_falling is a coin flip on every process -> pure noise in the score.
+    * ADF is the sharpest discriminator (2% pass on RW) but only 1 vote of 6;
+      5/6 >= 0.80 lets the gate open with ADF failing.
+    * AR(1) half-life on a 120-bar random walk is biased toward reversion, so
+      half_life_range passes 64% of the time.
+- Re-entry lag (~60 bars) is driven by the 120-bar window still holding the
+  previous regime.
+- Weak OU (half-life 34) mostly rejected - correct, it's outside the 30-bar cap.
+- numpy gotcha: comparing arrays of str-Enum members (np.array(...) == Regime.X)
+  silently returns all False; use identity checks per element.
+
+--------------------------------------------------------------------------------
+PART 5: OPEN ITEMS / NEXT STEPS
+--------------------------------------------------------------------------------
+1. Drop adf_falling.
+2. Make (ADF pass OR hurst < 0.40) mandatory, not one vote of six.
+3. ADF on a longer window (~250 bars) than the other features.
+4. Rerun gate_tests.py and compare against PART 3.
+5. Ideas raised for TRANSITIONAL: tighter risk (break-even stop / shorter time
+   stop), block scaling-in, max dwell (~20 bars) then TRENDING.
+6. Calibrate on real Nifty/BankNifty/MCX data: label bars by forward strategy
+   profitability; search enter_score, confirm_in, window length via the
+   strategy-search engine, scored on gated PnL net of costs.
+7. Live deployment checklist (discussed): closed-bar features only, event
+   blackouts (RBI, Budget, CPI, expiry, VIX spikes), persisted state +
+   broker reconciliation, kill switch, vol-scaled sizing, broker's SEBI
+   retail-algo requirements, monitor realized half-life and slippage drift.
