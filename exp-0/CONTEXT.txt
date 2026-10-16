@@ -1,0 +1,140 @@
+================================================================================
+ADAPTIVE VIRTUAL SWING CROSSOVER STRATEGY - CONTEXT RESUME (v4, 2026-10-17)
+================================================================================
+
+[SUMMARY]
+Pure Python/Numba trend-reversal indicator. Pine Script version DROPPED.
+ZigZag REMOVED. One causal state machine (virtual_swing_core) that tracks
+swing high/low, a ratcheting "virtual swing" level, and a reversal level.
+Repo: github.com/vikaschouhan/backtest_ai, directory exp-0/ (see README.md there).
+Code lives in the .py files; this file holds the spec, history and findings.
+
+--------------------------------------------------------------------------------
+PART 1: CURRENT SPEC (as decided by the user)
+--------------------------------------------------------------------------------
+- Arrays chronological: index 0 = oldest, -1 = latest.
+- Strictly causal: values at bar i use only bars 0..i (no lookahead).
+- threshold given in PERCENT (default 23.0), divided by 100 before use (thr).
+
+INIT (first init_bars bars, default 20)
+  swing_high = max(high), swing_low = min(low)
+  If the high came after the low -> start UP  (ath = swing_high, vsl = swing_low)
+  else                            -> start DOWN (atl = swing_low,  vsh = swing_high)
+
+UP trend (+1)
+  ath = highest high since trend start (updated with this bar's high FIRST)
+  vsl (virtual swing low) starts at the previous swing low; on each bar:
+      r = (ath - low) / (ath - vsl)
+      r >  thr : vsl unchanged
+      r <= thr : vsl = ath - (ath - low) / thr
+  rev_dn = vsl + (ath - vsl) * thr
+  close < rev_dn -> reverse to DOWN:
+      swing_high := ath  (previous ath becomes new swing high)
+      atl        := lowest low since the ath bar
+      vsh        := new swing high
+
+DOWN trend (-1) - mirror
+  atl = lowest low since trend start
+  vsh starts at the previous swing high; on each bar:
+      r = (high - atl) / (vsh - atl)
+      r >  thr : vsh unchanged
+      r <= thr : vsh = atl + (high - atl) / thr
+  rev_up = vsh - (vsh - atl) * thr
+  close > rev_up -> reverse to UP:
+      swing_low := atl, ath := highest high since the atl bar, vsl := new swing low
+
+Properties (verified):
+  - vsl only ratchets up, vsh only ratchets down within a leg.
+  - For thr <= 50%, the bar that moves vsl/vsh cannot flip trend on its own close.
+  - Trend flip == signal. Signals are on bar close -> fill at NEXT bar open in a backtest.
+
+--------------------------------------------------------------------------------
+PART 2: HISTORY / DECISIONS
+--------------------------------------------------------------------------------
+v0 (original context.txt): ZigZag + ath/atl + fixed 23% retracement stop.
+   Bugs found: init assigned whole arrays (lh_v = high), lookahead (pivots
+   back-filled onto pivot bar), ath/atl rarely seeded (v_sh mostly NaN).
+   Pine used ta.pivothigh/low, not ZigZag -> no parity.
+v1: Fixed ZigZag (confirmation-bar reporting) - then user chose to drop ZigZag.
+v1b: No ZigZag; reversal on close crossing ath - 23%*(ath - swing_low).
+   Result: ~1 flip every 3 bars (whipsaw: tiny leg range after each flip).
+   User said fixed 23% retracement was a mistake.
+v2a: Ratcheting virtual swing (rule above), reversal on close crossing vsl.
+   250 simulated bars: 3 swing highs / 3 swing lows. Clean but laggy.
+v2b (CURRENT): reversal on close crossing vsl + (ath - vsl)*thr (mirror for down).
+   Same data: 6 swing highs / 6 swing lows; earlier flips, catches mid swings.
+
+Tests (3000 synthetic bars, all PASS):
+  - causality: outputs on full data == outputs on prefix data at 300 cut points
+  - every flip promotes old ath/atl to new swing high/low
+  - long/short signals strictly alternate; a stop exists on every bar after init
+  - swing_low <= vsl <= rev_dn <= ath ; atl <= rev_up <= vsh <= swing_high
+  - vsl ratchets up, vsh ratchets down within a leg
+
+--------------------------------------------------------------------------------
+PART 4: AAPL BACKTEST (2026-10-16)
+--------------------------------------------------------------------------------
+Data: AAPL daily, 2025-10-10 -> 2026-10-09, 251 bars, read from the Yahoo Finance
+  history page (shell/yfinance blocked by proxy; only ~1 year shown on the page).
+  Unadjusted OHLC, dividends (~0.4%) ignored. Validated: no dupes, OHLC consistent.
+Execution: signal on close -> fill at NEXT open; flat until first signal;
+  5 bps per side; reversal pays twice. Trading starts 2025-11-07 (after 20 init bars).
+
+Results (threshold 23%, init_bars 20):
+                Return   MaxDD    Sharpe  Trades  Win%
+  Buy & hold    +24.8%   -13.8%   1.12      -      -
+  Long only     +20.6%   -10.3%   1.26      4     75
+  Long/short    +14.1%   -15.4%   0.72      8     62
+
+Trades (long/short):
+  2025-12-23 -> 2026-02-03 SHORT  +0.51%
+  2026-02-03 -> 2026-02-13 LONG   -2.77%
+  2026-02-13 -> 2026-04-07 SHORT  +2.13%
+  2026-04-07 -> 2026-06-09 LONG  +17.12%   (one trade = most of the P&L)
+  2026-06-09 -> 2026-07-06 SHORT  -2.46%
+  2026-07-06 -> 2026-08-03 LONG   +0.62%
+  2026-08-03 -> 2026-08-31 SHORT  -3.34%
+  2026-08-31 -> open       LONG   +5.28%
+
+Threshold sensitivity (long/short, init 20, 5 bps):
+  thr%: 10    15    20    23    25    30    35    40    45
+  ret%: -19.7 -29.8 -4.2  14.1  17.0  10.8  -9.0  -0.8  3.8
+  trd :  4     8     8     8     8    14    26    32    46
+Conclusion: narrow peak at 23-25% on one year / 8 trades = likely overfit, not
+  yet evidence of an edge. Shorts lost money in a rising year.
+
+--------------------------------------------------------------------------------
+PART 5: ENHANCEMENT STUDY (2026-10-16)
+--------------------------------------------------------------------------------
+Engine options added to StrategyParams (all OFF by default = identical to spec):
+  rev_threshold (separate % for reversal line), min_cushion_atr, confirm_atr, atr_len.
+Backtest overlays (OFF by default): sma_len (trend-regime filter: longs only above
+  SMA, shorts only below, else flat), vol_size (size = min(1, typical_vol/current_vol)).
+Speed: engine ~55 ms per 1M bars (Numba, single pass) - not a bottleneck.
+
+Method: each idea vs baseline at the SAME threshold, thresholds 15..35 step 5,
+  medians reported. Data: GOOG daily 2004-13, EURUSD 1h (5000 bars), AAPL 1y,
+  BTC monthly (too few trades - ignored), 20 random walks (null test).
+
+Findings (long/short, median Sharpe / max DD):
+                         GOOG            EURUSD 1h
+  baseline               0.29 / -45%     -0.96 / -7.3%
+  + vol sizing           0.46 / -40%     -0.60 / -5.5%
+  + SMA filter           0.51 / -32%      0.35 / -3.4%
+  + confirm 0.5 ATR      0.62 / -29%      0.36 / -3.8%
+  KEEP: vol sizing, SMA regime filter (cut DD on every real set and on random walks).
+  OPTIONAL: confirm 0.5 ATR (fewer trades; helps GOOG, mixed elsewhere).
+  DROP: separate reversal threshold, min cushion 2 ATR (mixed / neutral).
+Caveat: on random walks the signal is ~zero edge (overlays only reduce risk).
+  GOOG thr 23 long/short + all overlays: max DD -25% vs buy&hold -65%, but grows
+  ~3.3x vs buy&hold ~7x. Overlays manage risk; they do not add prediction.
+
+--------------------------------------------------------------------------------
+PART 6: OPEN ITEMS / NEXT STEPS
+--------------------------------------------------------------------------------
+- Same study on 10+ yrs of Nifty / Bank Nifty daily (needs CSVs from the user).
+- Walk-forward validation of threshold 20-30%.
+- Numba-compile the backtest loop if large parameter sweeps are needed.
+- Adjusted prices / dividends; realistic costs for target market.
+- Init is a heuristic (max/min of first init_bars); could accept user-supplied swings.
+================================================================================

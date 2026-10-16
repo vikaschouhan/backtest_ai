@@ -1,0 +1,5 @@
+numpy
+pandas
+numba
+matplotlib
+backtesting   # only for its bundled GOOG / EURUSD / BTCUSD sample CSVs
