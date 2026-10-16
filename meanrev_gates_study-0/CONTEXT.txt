@@ -1,5 +1,5 @@
 ================================================================================
-MEAN-REVERSION REGIME GATE STUDY - CONTEXT RESUME (v1, 2026-10-17)
+MEAN-REVERSION REGIME GATE STUDY - CONTEXT RESUME (v2, 2026-10-17)
 ================================================================================
 
 [SUMMARY]
@@ -47,6 +47,18 @@ TRANSITIONS (evaluated in this order each bar)
   Blackout: allow_entries = False in any state; if blackout_forces_exit, also
   force_exit. State itself is unchanged.
   All thresholds live in GateConfig.
+
+V2/V3 OPTIONS (GateConfig; defaults reproduce v1 exactly)
+  use_adf_falling  True  -> False drops the adf_falling check (5 checks)
+  require_core     False -> True: mandatory "core" test each bar:
+                   core = adf_pvalue < adf_p_max OR hurst < core_hurst_max (0.40)
+                   core fails -> score = min(score, core_fail_cap=0.50), reason
+                   "core_fail". 0.50 < exit 0.55 (blocks entry / leaves MR after
+                   confirm_out) and > trend 0.30 (no forced flat on its own).
+  v2_config()  = use_adf_falling=False, require_core=True
+  v3_config()  = v2 + core_hurst_max=-inf (core = ADF alone)
+  ADF window is a feature-side choice: v2/v3 are meant to get ADF on 250 bars
+  (other features stay on 120).
 
 PERSISTENCE
   to_json() / from_json() save config, state, counters, cooldown and the
@@ -110,18 +122,53 @@ PART 4: FINDINGS
   silently returns all False; use identity checks per element.
 
 --------------------------------------------------------------------------------
-PART 5: OPEN ITEMS / NEXT STEPS
+PART 5: FIX ATTEMPT - ABLATION (gate_ablation.py, results/v2/)
 --------------------------------------------------------------------------------
-1. Drop adf_falling.
-2. Make (ADF pass OR hurst < 0.40) mandatory, not one vote of six.
-3. ADF on a longer window (~250 bars) than the other features.
-4. Rerun gate_tests.py and compare against PART 3.
-5. Ideas raised for TRANSITIONAL: tighter risk (break-even stop / shorter time
+Same 10 seeds; features computed once per seed (ADF on 120 and 250 bars) and
+shared by all variants. Metrics from bar 120 for every variant (ADF250 has no
+value before bar 250 -> counted as a cost).
+
+  variant                 OUs MR%  RW MR%  TR MR%  TR PnL  RS PnL  prec/rec  lag out/in
+  v1                        85.5    27.8     6.3    -6.6   +19.8    72/69     16/60
+  drop adf_falling          94.7    36.5    10.0    -9.3   +23.0    70/79     36/56
+  + core (adf120|H<.40)     82.8    23.1     7.1    -7.0   +18.4    73/68     22/56
+  + adf250 = v2              94.1    24.1     7.0    -5.9   +23.2    74/78     58/63
+  drop adf_falling+adf250   96.8    37.2    10.5    -8.8   +24.8    71/84     58/61
+  v3 (core = adf250 only)   83.6     3.6     0.5    -0.2   +14.8    82/51     22/97
+  (OUs = strong OU, RW = random walk, TR = trend, RS = regime switch;
+   ungated PnL: OUs +64.3, OU weak +18.3, RW -5.9, TR -73.9, RS -4.6;
+   OU weak MR%: v1 40.5, v2 36.3, v3 11.5. Gated PnL sd ~6-13 pts.)
+
+Diagnostics (3 seeds, windows every 5 bars from bar 250):
+  process      hurst120 median  P(H<.40)  P(adf120<.05)  P(adf250<.05)  P(v2 core)
+  random_walk       0.45           32%         2%             4%           35%
+  ou_strong         0.30           87%        39%            95%           99%
+  trend             0.45           32%         3%             1%           33%
+
+Findings:
+- Dropping adf_falling alone is WORSE: 0.80 entry = 4/5 instead of 5/6.
+- v2 barely helps: its core passes via Hurst, and 120-bar Hurst is biased low
+  (0.45 median on a pure random walk).
+- ADF on 250 bars is the sharp discriminator (95% vs 4% vs 1%).
+- v3 removes false positives (RW 3.6%, trend 0.5%, trend loss ~0, precision
+  82%) while strong OU stays at v1's level. Cost: recall 51%, re-entry lag ~97
+  bars, weak OU mostly rejected. ~130 bars of recall loss is backtest warm-up.
+- Recommendation: v3 as the safe default where false "on" is costly; v1/v2
+  where missed MR stretches cost more.
+
+--------------------------------------------------------------------------------
+PART 6: OPEN ITEMS / NEXT STEPS
+--------------------------------------------------------------------------------
+1. Speed v3 re-entry without reopening false positives: ADF250 for entry only,
+   faster 120-bar checks + hard break for exit; or try a ~180-bar ADF.
+2. Replace/bias-correct the 120-bar Hurst, lengthen its window, or drop it.
+3. Realistic costs and >= 50 seeds so PnL gaps are resolvable.
+4. Ideas raised for TRANSITIONAL: tighter risk (break-even stop / shorter time
    stop), block scaling-in, max dwell (~20 bars) then TRENDING.
-6. Calibrate on real Nifty/BankNifty/MCX data: label bars by forward strategy
+5. Calibrate on real Nifty/BankNifty/MCX data: label bars by forward strategy
    profitability; search enter_score, confirm_in, window length via the
    strategy-search engine, scored on gated PnL net of costs.
-7. Live deployment checklist (discussed): closed-bar features only, event
+6. Live deployment checklist (discussed): closed-bar features only, event
    blackouts (RBI, Budget, CPI, expiry, VIX spikes), persisted state +
    broker reconciliation, kill switch, vol-scaled sizing, broker's SEBI
    retail-algo requirements, monitor realized half-life and slippage drift.

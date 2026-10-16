@@ -96,3 +96,47 @@ def test_ou_half_life_recovers_known_value():
         x[i] = x[i - 1] - theta * x[i - 1] + rng.standard_normal()
     expected = -np.log(2) / np.log(1 - theta)   # ~6.58 bars
     assert abs(ou_half_life(x) - expected) < 1.0
+
+
+# ---------------- v2 / v3 options ----------------
+
+from regime_gate import v2_config  # noqa: E402
+
+
+def test_defaults_reproduce_v1():
+    c = GateConfig()
+    assert c.use_adf_falling and not c.require_core
+
+
+def test_dropping_adf_falling_removes_the_check():
+    g = RegimeGate(GateConfig(use_adf_falling=False))
+    d = warm(g)
+    assert not any("adf_falling" in r for r in d.reasons)
+    assert d.score == 1.0          # 5 of 5
+
+
+def test_core_fail_caps_score_and_blocks_entry():
+    # everything passes except ADF, and Hurst is 0.42 (> core 0.40)
+    f = Features(hurst=0.42, adf_pvalue=0.30, half_life=6.0, adx=12.0)
+    g = RegimeGate(v2_config())
+    decisions = [g.on_bar(f) for _ in range(40)]
+    assert all(d.score <= 0.50 for d in decisions)
+    assert all("core_fail" in d.reasons for d in decisions)
+    assert all(d.regime is not Regime.MEAN_REVERTING for d in decisions)
+    assert not any(d.force_exit for d in decisions)   # cap stays above 0.30
+
+
+def test_core_passes_on_strong_hurst_in_v2_but_not_v3():
+    f = Features(hurst=0.30, adf_pvalue=0.30, half_life=6.0, adx=12.0)
+    v2 = RegimeGate(v2_config())
+    v3 = RegimeGate(v2_config(core_hurst_max=float("-inf")))
+    assert warm(v2, f=f).regime is Regime.MEAN_REVERTING
+    assert warm(v3, f=f).regime is not Regime.MEAN_REVERTING
+
+
+def test_core_failure_in_mr_moves_to_transitional_not_flat():
+    g = RegimeGate(v2_config(confirm_out=2))
+    assert warm(g).regime is Regime.MEAN_REVERTING
+    f = Features(hurst=0.44, adf_pvalue=0.30, half_life=6.0, adx=12.0)
+    d1, d2 = g.on_bar(f), g.on_bar(f)
+    assert d2.regime is Regime.TRANSITIONAL and not d2.force_exit

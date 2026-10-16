@@ -83,6 +83,28 @@ class GateConfig:
     # --- blackout behaviour ---
     blackout_forces_exit: bool = False   # True = flatten into events
 
+    # --- v2 options (defaults reproduce v1 behaviour) ---
+    use_adf_falling: bool = True         # v2: False (check carried no signal)
+    require_core: bool = False           # v2: True
+    core_hurst_max: float = 0.40         # core = ADF passes OR hurst < this
+    core_fail_cap: float = 0.50          # score cap when core fails: below
+                                         # exit_score (blocks/leaves MR) but
+                                         # above trend_score (no forced flat)
+
+
+def v2_config(**overrides) -> GateConfig:
+    """GateConfig with the fixes from the synthetic study switched on.
+    Pair it with an ADF p-value computed on a longer window (~250 bars)."""
+    return GateConfig(**{"use_adf_falling": False, "require_core": True,
+                         **overrides})
+
+
+def v3_config(**overrides) -> GateConfig:
+    """v2 with the mandatory test reduced to ADF alone (Hurst on short
+    windows is biased low on random walks). Feed it ADF on ~250 bars.
+    Higher precision, lower recall and slower re-entry than v1/v2."""
+    return v2_config(**{"core_hurst_max": float("-inf"), **overrides})
+
 
 @dataclass
 class GateDecision:
@@ -133,15 +155,24 @@ class RegimeGate:
         check("half_life_stable", hl_ok)
 
         # ADF p-value trending down (or already deep)
-        adf_ok = None
-        w = c.adf_trend_window
-        if len(self._adf_hist) >= 2 * w:
-            arr = np.asarray(self._adf_hist)
-            adf_ok = arr[w:].mean() <= arr[:w].mean() or arr[w:].mean() < 0.01
-        check("adf_falling", adf_ok)
+        if c.use_adf_falling:
+            adf_ok = None
+            w = c.adf_trend_window
+            if len(self._adf_hist) >= 2 * w:
+                arr = np.asarray(self._adf_hist)
+                adf_ok = arr[w:].mean() <= arr[:w].mean() or arr[w:].mean() < 0.01
+            check("adf_falling", adf_ok)
 
         score = len(passed) / (len(passed) + len(failed))
         return score, passed, failed
+
+    def _core_ok(self, f: Features) -> bool:
+        """Mandatory evidence of stationarity: ADF rejects a unit root OR
+        Hurst is clearly below 0.5."""
+        c = self.cfg
+        adf = f.adf_pvalue is not None and f.adf_pvalue < c.adf_p_max
+        hur = f.hurst is not None and f.hurst < c.core_hurst_max
+        return adf or hur
 
     def _hard_break(self, f: Features) -> list[str]:
         c, r = self.cfg, []
@@ -163,6 +194,9 @@ class RegimeGate:
 
         score, passed, failed = self._score(f)
         reasons = [f"score={score:.2f}", f"fail={','.join(failed) or '-'}"]
+        if c.require_core and not self._core_ok(f):
+            score = min(score, c.core_fail_cap)
+            reasons.append("core_fail")
         force_exit = False
 
         if self._cooldown > 0:

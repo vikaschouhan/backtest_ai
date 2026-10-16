@@ -29,16 +29,18 @@ elif d.allow_entries and abs(z) > 2:
 
 | File | What it is |
 |---|---|
-| `regime_gate.py` | `RegimeGate`, `GateConfig`, `Features`, `GateDecision`; JSON state save/restore; reference Hurst, OU half-life, ADF, ADX implementations (for parity with a C feature kernel); `python regime_gate.py` runs a small demo |
+| `regime_gate.py` | `RegimeGate`, `GateConfig`, `Features`, `GateDecision`, `v2_config()`, `v3_config()`; JSON state save/restore; reference Hurst, OU half-life, ADF, ADX implementations (for parity with a C feature kernel); `python regime_gate.py` runs a small demo |
 | `gate_tests.py` | Synthetic scenarios (strong OU, weak OU, random walk, trend, regime switch), a toy z-score strategy run gated vs ungated, figures and `summary.csv` |
-| `tests/test_regime_gate.py` | Hysteresis, hard break + cooldown, blackout, JSON round-trip, half-life estimator checks |
-| `results/` | Figures and CSV produced by `gate_tests.py` |
+| `gate_ablation.py` | v1 vs fix variants (v2, v3) on the same seeds and shared features; writes `results/v2/` |
+| `tests/test_regime_gate.py` | Hysteresis, hard break + cooldown, blackout, JSON round-trip, half-life estimator, v2/v3 option checks |
+| `results/` | v1 figures and CSV from `gate_tests.py`; `results/v2/` ablation table, comparison chart and v3 per-scenario figures |
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
-python gate_tests.py 10        # 10 seeds per scenario, ~2 min; writes results/
+python gate_tests.py 10        # v1, 10 seeds per scenario, ~2 min; writes results/
+python gate_ablation.py 10     # v1 vs v2/v3 ablation, ~3 min; writes results/v2/
 python -m pytest -q tests
 ```
 
@@ -67,10 +69,55 @@ regime ends, 60 bars to re-enter after mean reversion resumes.
   **ADF falling 52%** (vs 56% on strong OU — it carries no information).
 - Re-entry lag is set by the window length: the window keeps seeing the old regime.
 
-## Next steps (not yet done)
+## Fix attempt: v2 and v3 (`gate_ablation.py`, results in `results/v2/`)
 
-1. Drop the `adf_falling` check.
-2. Require ADF pass **or** Hurst < 0.40 as a mandatory condition rather than one vote of six.
-3. Compute ADF on a longer window (~250 bars) than the other features.
-4. Re-run `gate_tests.py` and compare; then calibrate thresholds on Nifty/BankNifty using
-   gated strategy PnL, not classification accuracy.
+Fixes are switches on `GateConfig` (defaults still reproduce v1): `use_adf_falling`,
+`require_core` + `core_hurst_max` (mandatory "ADF passes OR Hurst < x"; failing caps the
+score at `core_fail_cap` = 0.50, so it blocks or leaves MR without forcing flat), and the
+ADF window is chosen on the feature side. `v2_config()` = drop adf_falling + core
+(ADF or Hurst < 0.40); `v3_config()` = core is ADF alone. Both fed ADF on 250 bars.
+Same 10 seeds; features computed once and shared by all variants.
+
+| Variant | OU strong MR% | Random walk MR% | Trend MR% | Trend PnL | Regime switch PnL | Precision / recall | Lag out / in |
+|---|---|---|---|---|---|---|---|
+| v1 | 86 | 28 | 6.3 | −6.6 | +19.8 | 72 / 69 | 16 / 60 |
+| drop adf_falling | 95 | 37 | 10.0 | −9.3 | +23.0 | 70 / 79 | 36 / 56 |
+| + core (ADF120 or H<0.40) | 83 | 23 | 7.1 | −7.0 | +18.4 | 73 / 68 | 22 / 56 |
+| + ADF250 = **v2** | 94 | 24 | 7.0 | −5.9 | +23.2 | 74 / 78 | 58 / 63 |
+| drop adf_falling + ADF250 | 97 | 37 | 10.5 | −8.8 | +24.8 | 71 / 84 | 58 / 61 |
+| **v3** (core = ADF250 only) | 84 | **3.6** | **0.5** | **−0.2** | +14.8 | **82** / 51 | 22 / 97 |
+
+Ungated PnL: OU strong +64, random walk −6, trend −74, regime switch −5. Gated PnL has a
+seed-to-seed sd of ~6–13 pts, so PnL gaps between variants under ~10 pts are noise; the
+MR% columns are the more reliable signal.
+
+![Ablation](results/v2/fig_ablation.png)
+![v3 regime switch](results/v2/fig_regime_switch.png)
+
+What the ablation shows:
+
+- **Dropping `adf_falling` alone makes things worse.** With 5 checks the 0.80 entry bar
+  means 4 of 5 instead of 5 of 6, so the gate gets *more* permissive (random walk 28→37%).
+- **v2 barely helps (random walk 28→24%).** Its mandatory test passes through Hurst: the
+  120-bar Hurst estimator reads a median **0.45 on a pure random walk** and is < 0.40 on
+  32% of windows, so "ADF or Hurst" passes 35% of the time on random walks and trends.
+- **ADF on 250 bars is the sharp test:** p < 0.05 on 95% of strong-OU windows, 4% of
+  random-walk windows, 1% of trend windows.
+- **v3 fixes the false positives:** random walk 28→3.6%, trend 6.3→0.5% with the trend
+  loss gone, precision 72→82%, and strong OU keeps 84% (same as v1).
+- **v3's price is recall and re-entry speed:** recall 69→51% and re-entry lag 60→97 bars,
+  since 250 bars must pass before ADF re-confirms. Part of the recall loss is the backtest
+  warm-up (no ADF before bar 250, which costs ~130 truly-MR bars); live, the history
+  would already be there. Weak OU (half-life ≈ 34) is now mostly rejected (11%).
+
+**Which to use:** v3 if a false "on" is expensive (real costs, slippage, MCX thin books),
+v1/v2 if missing mean-reverting stretches is the bigger cost. v3 is the safer default.
+
+## Next steps
+
+1. Speed up v3's re-entry without reopening false positives, e.g. ADF on 250 bars for
+   *entry* but the faster 120-bar checks plus hard break for *exit*, or a 180-bar ADF.
+2. Replace the 120-bar Hurst (biased low) with a bias-corrected estimator or a longer
+   window, or drop it from the score.
+3. Repeat with realistic costs and more seeds (≥ 50) so PnL differences are resolvable.
+4. Calibrate on Nifty/BankNifty/MCX, scoring thresholds on gated PnL net of costs.
